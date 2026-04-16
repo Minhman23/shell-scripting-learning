@@ -200,7 +200,8 @@ do_install() {
   cat > "$FILTER" << 'WRAPPER_EOF'
 #!/usr/bin/env bash
 # fkit-reporter-filter.sh — CWD filter for FKit Reporter
-# Integrity check + CWD filtering + scrub
+# Leak vectors addressed: incoming events, crash recovery, auto-backfill,
+#   backfill CLI, flush, overflow, .sending.*, state files, exec bypass.
 
 REAL_HOOK="$HOME/.claude/hooks/fkit-reporter.sh"
 CONF="$HOME/.claude/hooks/fkit-filter.conf"
@@ -321,11 +322,121 @@ if os.path.isdir(sdir):
 PY
 }
 
+# Pre-clean non-allowed state files so crash recovery won't generate personal events
+_pre_clean_state() {
+  [[ -d "$STATE_DIR" ]] || return 0
+  python3 - "$CONF" "$STATE_DIR" << 'PY' 2>/dev/null || true
+import json, os, sys
+conf_path, sdir = sys.argv[1], sys.argv[2]
+allowed = []
+try:
+    with open(conf_path) as f:
+        for line in f:
+            line = line.split('#')[0].strip()
+            if line: allowed.append(line.replace('\\', '/'))
+except: pass
+if not allowed: sys.exit(0)
+def norm(p): return p.replace('\\', '/')
+projects_dir = os.path.expanduser("~/.claude/projects")
+for state_fn in list(os.listdir(sdir)):
+    if not state_fn.endswith(".last_uuid"): continue
+    session_id = state_fn[:-len(".last_uuid")]
+    cwd_found = ""
+    if os.path.isdir(projects_dir):
+        for root, dirs, files in os.walk(projects_dir):
+            if session_id + ".jsonl" in files:
+                tp = os.path.join(root, session_id + ".jsonl")
+                try:
+                    with open(tp, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line: continue
+                            try:
+                                e = json.loads(line)
+                                if e.get("cwd"): cwd_found = norm(e["cwd"]); break
+                            except: pass
+                except: pass
+                break
+    if not any(cwd_found.startswith(a) for a in allowed):
+        try: os.remove(os.path.join(sdir, state_fn))
+        except: pass
+PY
+}
+
 case "${1:-}" in
   --status)   exec "$REAL_HOOK" "$@" ;;
   --update)   exec "$REAL_HOOK" "$@" ;;
-  --flush)    _scrub; exec "$REAL_HOOK" "$@" ;;
+  --flush)
+    _scrub
+    _pre_clean_state
+    cp "$REAL_HOOK" "${REAL_HOOK}.pre-flush" 2>/dev/null || true
+    "$REAL_HOOK" "$@"
+    _scrub
+    exit 0
+    ;;
   --backfill) echo "[fkit-filter] backfill disabled."; exit 0 ;;
+  --audit)
+    echo "[fkit-filter] Leak audit"
+    python3 - "$CONF" "$QUEUE_DIR" "$OVERFLOW" "$STATE_DIR" "$HOME" << 'AUDIT_PY'
+import json, os, sys
+conf_path, qdir, ovf_path, sdir, home = sys.argv[1:6]
+allowed = []
+try:
+    with open(conf_path) as f:
+        for line in f:
+            line = line.split('#')[0].strip()
+            if line: allowed.append(line.replace('\\', '/'))
+except: pass
+print(f"  Allowed: {allowed}")
+def norm(p): return p.replace('\\', '/')
+def cwd_ok(cwd):
+    return any(norm(cwd).startswith(a) for a in allowed)
+total = non_allowed = no_cwd = 0
+if os.path.isdir(qdir):
+    for proj in os.listdir(qdir):
+        pdir = os.path.join(qdir, proj)
+        if not os.path.isdir(pdir): continue
+        for fn in os.listdir(pdir):
+            if not fn.endswith(".jsonl"): continue
+            try:
+                with open(os.path.join(pdir, fn)) as f:
+                    for line in f:
+                        total += 1
+                        try:
+                            cwd = json.loads(line.strip()).get("cwd", "")
+                            if not cwd: no_cwd += 1
+                            elif not cwd_ok(cwd): non_allowed += 1
+                        except: pass
+            except: pass
+non_state = 0; total_state = 0
+projects_dir = os.path.expanduser("~/.claude/projects")
+if os.path.isdir(sdir):
+    for sf in os.listdir(sdir):
+        if not sf.endswith(".last_uuid"): continue
+        total_state += 1
+        sid = sf[:-len(".last_uuid")]; cwd_found = ""
+        if os.path.isdir(projects_dir):
+            for root, dirs, files in os.walk(projects_dir):
+                if sid + ".jsonl" in files:
+                    try:
+                        with open(os.path.join(root, sid + ".jsonl"), encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line: continue
+                                try:
+                                    e = json.loads(line)
+                                    if e.get("cwd"): cwd_found = norm(e["cwd"]); break
+                                except: pass
+                    except: pass
+                    break
+        if not any(cwd_found.startswith(a) for a in allowed): non_state += 1
+print(f"  Queue: {total} events ({non_allowed} non-allowed, {no_cwd} no-cwd)")
+print(f"  State: {total_state} files ({non_state} non-allowed)")
+issues = non_allowed + no_cwd + non_state
+print(f"  {'OK' if issues == 0 else str(issues) + ' potential leaks'}")
+AUDIT_PY
+    exit 0
+    ;;
 esac
 
 if ! _check_hook_integrity; then exit 0; fi
@@ -334,6 +445,9 @@ PAYLOAD=$(cat)
 [[ -z "$PAYLOAD" ]] && exit 0
 CWD=$(python3 -c "import json,sys;print(json.load(sys.stdin).get('cwd',''))" <<< "$PAYLOAD" 2>/dev/null) || CWD=""
 if _cwd_allowed "$CWD"; then
+  _scrub
+  _pre_clean_state
+  date +%s > "$HOME/.fkit-reporter-lastflush" 2>/dev/null || true
   echo "$PAYLOAD" | "$REAL_HOOK"
   _scrub
 fi
@@ -411,11 +525,48 @@ do_approve() {
   echo -e "  Hash now:    ${D}${current:-none}${N}"
   echo ""
 
-  # Show what changed if git available
-  if command -v diff &>/dev/null && [[ -f "$ORIGINAL" ]]; then
-    local line_count
-    line_count=$(wc -l < "$ORIGINAL" 2>/dev/null || echo "?")
-    echo -e "  ${D}$ORIGINAL ($line_count lines)${N}"
+  # Auto leak-check: analyze new reporter for risks
+  echo -e "  ${B}Auto leak-check:${N}"
+  local _issues=0
+
+  # 1. CWD field still in payload?
+  if grep -q 'get("cwd"' "$ORIGINAL" 2>/dev/null; then
+    ok "CWD field preserved in payload"
+  else
+    warn "CWD field may be missing — filter could be ineffective"
+    _issues=$((_issues+1))
+  fi
+
+  # 2. New CLI flags not handled by filter?
+  local _reporter_flags _filter_flags _unhandled
+  _reporter_flags=$(grep -oE '\-\-[a-z][-a-z]*' "$ORIGINAL" 2>/dev/null | sort -u)
+  _filter_flags=$(grep -oE '\-\-[a-z][-a-z]*' "$FILTER" 2>/dev/null | sort -u)
+  _unhandled=$(comm -23 <(echo "$_reporter_flags") <(echo "$_filter_flags") 2>/dev/null | grep -v '^$' || true)
+  if [[ -z "$_unhandled" ]]; then
+    ok "All reporter CLI flags handled by filter"
+  else
+    warn "New flags in reporter not in filter: $_unhandled"
+    _issues=$((_issues+1))
+  fi
+
+  # 3. Self-update mechanism?
+  if grep -q 'curl.*fkit-reporter' "$ORIGINAL" 2>/dev/null; then
+    info "Self-update mechanism present (hash will change on next update)"
+  fi
+
+  # 4. Diff with pre-flush backup if available
+  if [[ -f "${ORIGINAL}.pre-flush" ]]; then
+    local _diff_lines
+    _diff_lines=$(diff "${ORIGINAL}.pre-flush" "$ORIGINAL" 2>/dev/null | wc -l || echo 0)
+    if [[ "$_diff_lines" -gt 0 ]]; then
+      info "$_diff_lines lines changed from previous version"
+    fi
+  fi
+
+  if [[ $_issues -eq 0 ]]; then
+    ok "No leak risks detected"
+  else
+    warn "$_issues potential issue(s) found — review before approving"
   fi
 
   echo ""
