@@ -45,6 +45,7 @@ CONF="$HOOKS_DIR/fkit-filter.conf"                  # Allowed CWD prefixes (one 
 HASH_FILE="$HOOKS_DIR/fkit-reporter.sha256"         # SHA256 baseline of reporter
 AUTO_REVIEW="$HOOKS_DIR/fkit-filter-auto-review.py" # Auto-review script for leak analysis
 HARDEN="$HOOKS_DIR/fkit-reporter-harden.sh"         # Restores filter routing after reporter hijacks settings.json
+SKILL="$HOME/.claude/commands/report-claude.md"     # /report-claude skill — runs harden after --flush / --update
 REVIEW_LOG="$HOOKS_DIR/fkit-filter-review.log"      # Audit trail of all reviews
 
 # ── Colors ──────────────────────────────────────────────────────────────────
@@ -973,6 +974,103 @@ HARDEN_EOF
   chmod +x "$HARDEN"
   ok "Harden script installed"
 
+  # ── Write /report-claude skill ────────────────────────────────────────
+  # Skill runs harden.sh after --flush / --update so settings.json routing
+  # is restored immediately, before the next hook event fires.
+  mkdir -p "$(dirname "$SKILL")" 2>/dev/null || true
+  cat > "$SKILL" << 'SKILL_EOF'
+Manage FKit Claude Reporter. Supports sub-commands: `update`, `status`, or no argument (default: flush + report).
+
+Check if the user provided a sub-command in their message (e.g. "/report-claude update" or "/report-claude:update").
+
+**OS detection:** Run `uname` to detect OS. On macOS/Linux use bash commands. On Windows use the PowerShell commands below — they use `[System.Environment]::GetEnvironmentVariable("KEY","User")` to read from Windows Registry (works in git-bash, CMD, and PS without shell-expansion issues).
+
+**Windows hook path:** `[System.Environment]::GetFolderPath("UserProfile") + "\.claude\hooks\fkit-reporter.ps1"`
+**macOS/Linux hook path:** `~/.claude/hooks/fkit-reporter.sh`
+
+---
+
+## If sub-command is `update`:
+
+**macOS / Linux:**
+```bash
+chflags nouchg ~/.claude/hooks/fkit-reporter.sh
+~/.claude/hooks/fkit-reporter.sh --update
+chflags uchg ~/.claude/hooks/fkit-reporter.sh
+~/.claude/hooks/fkit-reporter-harden.sh
+python3 ~/.claude/hooks/fkit-filter-auto-review.py \
+  ~/.claude/hooks/fkit-reporter.sh ~/.claude/hooks/fkit-reporter-filter.sh
+```
+
+Flow:
+- `chflags nouchg` unlocks the reporter so `--update` can write.
+- `--update` downloads a fresh reporter from the server and hijacks
+  `settings.json` at the end (its rewrite runs regardless of mv result).
+- `chflags uchg` re-locks so background auto-update on next session_start
+  cannot replace the binary (mv fails → subshell exits → no rewrite).
+- `fkit-reporter-harden.sh` re-points settings.json hooks back at the filter
+  wrapper so the CWD filter is restored before the next event fires.
+- The final dry-run of `fkit-filter-auto-review.py` surfaces any new leak
+  vectors. If `PASS`, the next real event auto-syncs hash baseline. If
+  `BLOCK`, run `fkit-filter` option 3 to approve manually or roll back.
+
+DO NOT sync `fkit-reporter.sha256` manually — let the filter's built-in
+hash check trigger auto-review on the next hook event.
+
+---
+
+## Default (no sub-command): flush + report
+
+**macOS / Linux — run in sequence:**
+```bash
+~/.claude/hooks/fkit-reporter.sh --flush
+~/.claude/hooks/fkit-reporter-harden.sh
+~/.claude/hooks/fkit-reporter.sh --status
+curl -s -H "Authorization: Bearer $FKIT_API_KEY" "$FKIT_REPORTER_URL/api/reporter/summary"
+```
+
+`--flush` will try to auto-update the reporter and rewrite settings.json
+to bypass the filter wrapper. The `uchg` lock blocks the mv but the
+settings.json rewrite runs regardless, so `fkit-reporter-harden.sh`
+restores filter routing right after.
+
+---
+
+**Claude Reporter** [if updated: "(updated to vN)"]
+
+**Queue:** [events flushed or pending from --status output]
+**Last flush:** [Xs ago from --status output]
+
+**Hôm nay**
+- Sessions: [today.sessions]
+- Input: [today.inputFmt] tokens / Output: [today.outputFmt] tokens
+
+**7 ngày qua**
+- Sessions: [week.sessions]
+- Input: [week.inputFmt] / Output: [week.outputFmt]
+
+**Tổng:** [allTime.sessions] sessions
+
+🔗 Dashboard: $FKIT_REPORTER_URL/claude-report
+
+---
+
+If FKIT_API_KEY or FKIT_REPORTER_URL is not set, show a warning and skip the API call.
+Keep the full response under 20 lines.
+
+## Handling Invalid API Key (401 / "Invalid API key")
+
+If the response contains `"Invalid API key"` or returns HTTP 401:
+1. Use `AskUserQuestion` to ask the user for the new API key:
+   - question: "FKIT_API_KEY hiện tại không hợp lệ. Nhập API key mới từ Dashboard:"
+   - options: ["Nhập key mới", "Bỏ qua"]
+2. Once user provides the new key value:
+   - **macOS:** `sed -i '' 's|export FKIT_API_KEY=.*|export FKIT_API_KEY="<new_key>"|' ~/.zshrc`
+3. Re-run the summary call to verify, then show the report.
+4. Remind user to run `source ~/.zshrc` to apply.
+SKILL_EOF
+  ok "/report-claude skill installed"
+
   # Save baseline hash
   save_hash
   ok "Integrity baseline saved"
@@ -1007,6 +1105,30 @@ patch(data); dedup(data)
 with open(path, "w") as f: json.dump(data, f, indent=2, ensure_ascii=False); f.write("\n")
 PYEOF
   ok "settings.json patched"
+
+  # ── Lock reporter against background auto-update ──────────────────────
+  # fkit-reporter.sh has a background path (Notification session_start) that
+  # downloads a newer version and mv-replaces itself, then rewrites settings
+  # to bypass the filter. Locking the file makes mv fail → subshell exits
+  # before the settings rewrite.
+  #
+  # --flush / --update still rewrite settings.json regardless of mv result;
+  # those paths are covered by harden.sh (called from /report-claude skill).
+  case "$OS" in
+    macos)
+      if chflags uchg "$ORIGINAL" 2>/dev/null; then
+        ok "Reporter locked (chflags uchg) — background auto-update blocked"
+      else
+        warn "Could not lock reporter with chflags — background auto-update may rewrite settings"
+      fi
+      ;;
+    linux)
+      warn "Linux: run 'sudo chattr +i $ORIGINAL' manually to block background auto-update"
+      ;;
+    windows)
+      warn "Windows: file-immutable flag not set automatically; see README"
+      ;;
+  esac
 
   # ── Clean local data ──────────────────────────────────────────────────
   # Remove all queued events, state files, and temp files.
