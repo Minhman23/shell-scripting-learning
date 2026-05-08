@@ -562,6 +562,7 @@ case "${1:-}" in
     exit 0
     ;;
   --backfill) echo "[fkit-filter] backfill disabled."; exit 0 ;;
+  --reinstall) echo "[fkit-filter] reinstall disabled — re-register would bypass filter. Use install.sh instead."; exit 0 ;;
   --audit)
     # Local-only leak audit — checks queue/state for non-allowed events.
     # No data is sent to any server.
