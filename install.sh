@@ -188,6 +188,7 @@ remove_path() {
 
 # ── Folder editor submenu ──────────────────────────────────────────────────
 edit_folders() {
+  [[ "${AUTO_MODE:-false}" == "true" ]] && return 0
   while true; do
     echo ""
     echo -e "  ${B}Allowed folders${N} ${D}(only these get reported)${N}:"
@@ -1331,7 +1332,30 @@ do_status() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MAIN — Interactive menu
+# NON-INTERACTIVE MODE — env-var or CLI driven
+#
+# One-shot install/upgrade without menus. Idempotent.
+#
+#   FKIT_FILTER_PATHS=/Users/me/Dev/FPT bash <(curl -fsSL …/install.sh) --auto
+#   bash <(curl -fsSL …/install.sh) --auto --paths /Users/me/Dev/FPT
+#   bash <(curl -fsSL …/install.sh) --auto              # reuse existing conf
+#
+# Multiple paths: separate with ':' (e.g. /a/b:/c/d)
+# ═══════════════════════════════════════════════════════════════════════════
+AUTO_MODE=false
+AUTO_PATHS="${FKIT_FILTER_PATHS:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auto|-y)  AUTO_MODE=true; shift ;;
+    --paths)    AUTO_PATHS="$2"; AUTO_MODE=true; shift 2 ;;
+    --paths=*)  AUTO_PATHS="${1#--paths=}"; AUTO_MODE=true; shift ;;
+    *)          shift ;;
+  esac
+done
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN — Interactive menu (or auto branch below)
 # ═══════════════════════════════════════════════════════════════════════════
 
 echo ""
@@ -1347,6 +1371,47 @@ command -v python3 &>/dev/null || fail "python3 required"
 
 # Load current config
 load_paths
+
+# ── Auto branch — non-interactive install/upgrade ──────────────────────────
+if [[ "$AUTO_MODE" == "true" ]]; then
+  # Merge new paths from env/CLI into existing config (deduped)
+  if [[ -n "$AUTO_PATHS" ]]; then
+    IFS=':' read -ra _new_paths <<< "$AUTO_PATHS"
+    for _p in "${_new_paths[@]}"; do
+      [[ -z "$_p" ]] && continue
+      _resolved=$(resolve_case "$(resolve_path "$_p")")
+      _already=false
+      for _existing in "${PATHS[@]+"${PATHS[@]}"}"; do
+        [[ "$_existing" == "$_resolved" ]] && _already=true && break
+      done
+      [[ "$_already" == "false" ]] && PATHS+=("$_resolved")
+    done
+  fi
+
+  if [[ ${#PATHS[@]} -eq 0 ]]; then
+    fail "No allowed paths. Pass --paths /your/work/dir or set FKIT_FILTER_PATHS"
+  fi
+
+  # macOS: temporarily unlock reporter so we can re-baseline its hash cleanly.
+  # do_install never writes fkit-reporter.sh itself, but unlocking lets a
+  # prior --update'd state be re-hashed. do_install re-locks at the end.
+  [[ "$OS" == "macos" ]] && chflags nouchg "$ORIGINAL" 2>/dev/null || true
+
+  echo ""
+  echo -e "  ${B}Auto-install mode${N}"
+  echo "  Paths:"
+  for _p in "${PATHS[@]}"; do echo -e "    ${C}$_p${N}"; done
+
+  do_install
+
+  # Belt-and-suspenders: ensure lock + routing
+  [[ "$OS" == "macos" ]] && chflags uchg "$ORIGINAL" 2>/dev/null || true
+  [[ -x "$HARDEN" ]] && bash "$HARDEN" || true
+
+  echo ""
+  ok "Auto-install complete"
+  exit 0
+fi
 
 # Detect state
 INSTALLED=false
